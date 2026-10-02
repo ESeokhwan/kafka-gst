@@ -30,8 +30,7 @@ final class MonitorLogExtensionHandler(
   monitorLogWriter: MonitorLogWriter,
   executor: ExecutorService,
   maxRememberedDividerRequestIds: Int = 1024,
-  targetName: String = "monitor-log",
-  afterFlush: () => Unit = () => ()
+  targetName: String = "monitor-log"
 ) extends BrokerExtensionHandler {
   require(targetName != null && targetName.nonEmpty, "targetName must not be empty")
 
@@ -108,7 +107,6 @@ final class MonitorLogExtensionHandler(
       if (!monitorLogWriter.flush()) {
         throw new IllegalStateException("Monitor log commit failed")
       }
-      afterFlush()
     } catch {
       case error: InterruptedException =>
         Thread.currentThread().interrupt()
