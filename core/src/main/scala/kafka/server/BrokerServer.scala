@@ -35,11 +35,13 @@ import org.apache.kafka.common.security.scram.internals.ScramMechanism
 import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
 import org.apache.kafka.common.utils.{LogContext, Time, Utils}
 import org.apache.kafka.common.{ClusterResource, TopicPartition, Uuid}
+import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord
 import org.apache.kafka.coordinator.group.metrics.{GroupCoordinatorMetrics, GroupCoordinatorRuntimeMetrics}
 import org.apache.kafka.coordinator.group.{GroupConfigManager, GroupCoordinator, GroupCoordinatorRecordSerde, GroupCoordinatorService}
 import org.apache.kafka.coordinator.share.metrics.{ShareCoordinatorMetrics, ShareCoordinatorRuntimeMetrics}
 import org.apache.kafka.coordinator.share.{ShareCoordinator, ShareCoordinatorRecordSerde, ShareCoordinatorService}
+import org.apache.kafka.coordinator.globalsequence.{GlobalSequenceCoordinator, GlobalSequenceCoordinatorRecordSerde, GlobalSequenceCoordinatorService}
 import org.apache.kafka.coordinator.transaction.ProducerIdManager
 import org.apache.kafka.image.publisher.{BrokerRegistrationTracker, MetadataPublisher}
 import org.apache.kafka.metadata.{BrokerState, ListenerInfo}
@@ -132,6 +134,11 @@ class BrokerServer(
   var transactionCoordinator: TransactionCoordinator = _
 
   var shareCoordinator: ShareCoordinator = _
+  private var globalSequenceResources: org.apache.kafka.coordinator.globalsequence.GlobalSequenceResources = _
+  var globalSequenceCoordinator: GlobalSequenceCoordinator = _
+  var indexRoutingManager: IndexRoutingManager = _
+  var globalSequenceFetchManager: GlobalSequenceFetchManager = _
+  var globalSequenceIndexerManager: GlobalSequenceIndexerManager = _
 
   var clientToControllerChannelManager: NodeToControllerChannelManager = _
 
@@ -414,6 +421,27 @@ class BrokerServer(
         config, clientToControllerChannelManager, groupCoordinator,
         transactionCoordinator, shareCoordinator)
 
+      val globalConfig = config.globalSequenceCoordinatorConfig
+      globalSequenceResources = new org.apache.kafka.coordinator.globalsequence.GlobalSequenceResources(globalConfig, metrics, time)
+      globalSequenceCoordinator = createGlobalSequenceCoordinator()
+      val globalSequenceTransport = new GlobalSequenceNetworkClient(NetworkUtils.buildNetworkClient("GlobalSequence", config, metrics, time,
+        new LogContext(s"[GlobalSequence broker=${config.brokerId}]")), config.requestTimeoutMs, time, globalSequenceResources)
+      indexRoutingManager = new IndexRoutingManager(config.brokerId, config.globalSequenceCoordinatorConfig.indexTopicNumPartitions(),
+        config.interBrokerListenerName, () => metadataCache.getImage(), globalSequenceCoordinator,
+        globalSequenceTransport, kafkaScheduler, time, globalSequenceResources)
+      indexRoutingManager.startup()
+      val globalSequenceDataTransport = new GlobalSequenceNetworkClient(NetworkUtils.buildNetworkClient("GlobalSequenceData", config, metrics, time,
+        new LogContext(s"[GlobalSequenceData broker=${config.brokerId}]")), config.requestTimeoutMs, time, globalSequenceResources, data = true)
+      globalSequenceDataTransport.startup()
+      val globalSequenceDataRouter = new GlobalSequenceDataRouter(config.brokerId, config.interBrokerListenerName,
+        () => metadataCache.getImage(), new GlobalSequenceDataReader(replicaManager, kafkaScheduler, time,
+          GlobalSequenceDataReader.workers(globalConfig.readerNumThreads(), globalConfig.workerQueueSize()), globalSequenceResources),
+        globalSequenceDataTransport, kafkaScheduler, time, globalSequenceResources, ownsTransport = true)
+      globalSequenceFetchManager = new GlobalSequenceFetchManager(indexRoutingManager, globalSequenceDataRouter, kafkaScheduler, time, globalSequenceResources)
+      globalSequenceIndexerManager = GlobalSequenceIndexerManager(config.brokerId, config.globalSequenceCoordinatorConfig,
+        replicaManager, indexRoutingManager, kafkaScheduler, time, globalSequenceResources)
+      replicaManager.setGlobalSequenceIndexerManager(globalSequenceIndexerManager)
+
       dynamicConfigHandlers = Map[ConfigType, ConfigHandler](
         ConfigType.TOPIC -> new TopicConfigHandler(replicaManager, config, quotaManagers),
         ConfigType.BROKER -> new BrokerConfigHandler(config, quotaManagers),
@@ -472,6 +500,9 @@ class BrokerServer(
         groupCoordinator = groupCoordinator,
         txnCoordinator = transactionCoordinator,
         shareCoordinator = shareCoordinator,
+        globalSequenceCoordinator = globalSequenceCoordinator,
+        indexRoutingManager = indexRoutingManager,
+        globalSequenceFetchManager = globalSequenceFetchManager,
         autoTopicCreationManager = autoTopicCreationManager,
         brokerId = config.nodeId,
         config = config,
@@ -504,6 +535,8 @@ class BrokerServer(
         groupCoordinator,
         transactionCoordinator,
         shareCoordinator,
+        globalSequenceCoordinator,
+        globalSequenceIndexerManager,
         sharePartitionManager,
         new DynamicConfigPublisher(
           config,
@@ -658,6 +691,38 @@ class BrokerServer(
       .build()
   }
 
+  private def createGlobalSequenceCoordinator(): GlobalSequenceCoordinator = {
+    val coordinatorTime = Time.SYSTEM
+    val timer = new SystemTimerReaper(
+      "global-sequence-coordinator-reaper",
+      new SystemTimer("global-sequence-coordinator")
+    )
+    val loader = new CoordinatorLoaderImpl[CoordinatorRecord](
+      coordinatorTime,
+      replicaManager,
+      new GlobalSequenceCoordinatorRecordSerde,
+      config.globalSequenceCoordinatorConfig.loadBufferSize(),
+      CoordinatorLoaderImpl.DEFAULT_COMMIT_INTERVAL_OFFSETS,
+      requireFullLog = true
+    )
+    new GlobalSequenceCoordinatorService.Builder(config.brokerId, config.globalSequenceCoordinatorConfig)
+      .withTime(coordinatorTime)
+      .withTimer(timer)
+      .withLoader(loader)
+      .withWriter(new CoordinatorPartitionWriter(replicaManager))
+      .withIndexReader(new GlobalSequenceIndexReader(replicaManager, kafkaScheduler, coordinatorTime,
+        GlobalSequenceIndexReader.workers(config.globalSequenceCoordinatorConfig.readerNumThreads(), config.globalSequenceCoordinatorConfig.workerQueueSize()),
+        globalSequenceResources))
+      .withResources(globalSequenceResources)
+      .withMetrics(metrics)
+      .withTopicCreation(() => {
+        autoTopicCreationManager.createTopics(Set(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME),
+          UnboundedControllerMutationQuota, None)
+        ()
+      })
+      .build()
+  }
+
   private def createShareCoordinator(): ShareCoordinator = {
     val time = Time.SYSTEM
     val timer = new SystemTimerReaper(
@@ -794,6 +859,12 @@ class BrokerServer(
        * not flush the remaining partitions or write the clean shutdown marker. Ultimately, the
        * broker would have to take hours to recover the log during restart.
        */
+      if (globalSequenceIndexerManager != null)
+        CoreUtils.swallow(globalSequenceIndexerManager.close(), this)
+      if (globalSequenceFetchManager != null)
+        CoreUtils.swallow(globalSequenceFetchManager.close(), this)
+      if (indexRoutingManager != null)
+        CoreUtils.swallow(indexRoutingManager.close(), this)
       if (kafkaScheduler != null)
         CoreUtils.swallow(kafkaScheduler.shutdown(), this)
 
@@ -806,6 +877,10 @@ class BrokerServer(
         CoreUtils.swallow(groupCoordinator.shutdown(), this)
       if (shareCoordinator != null)
         CoreUtils.swallow(shareCoordinator.shutdown(), this)
+      if (globalSequenceCoordinator != null)
+        CoreUtils.swallow(globalSequenceCoordinator.shutdown(), this)
+      if (globalSequenceResources != null)
+        CoreUtils.swallow(globalSequenceResources.close(), this)
 
       if (assignmentsManager != null)
         CoreUtils.swallow(assignmentsManager.close(), this)

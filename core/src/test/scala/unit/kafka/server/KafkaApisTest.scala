@@ -127,6 +127,7 @@ class KafkaApisTest extends Logging {
   private val requestChannelMetrics: RequestChannelMetrics = mock(classOf[RequestChannelMetrics])
   private val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
   private val groupCoordinator: GroupCoordinator = mock(classOf[GroupCoordinator])
+  private val globalSequenceCoordinator = mock(classOf[org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinator])
   private val shareCoordinator: ShareCoordinator = mock(classOf[ShareCoordinator])
   private val txnCoordinator: TransactionCoordinator = mock(classOf[TransactionCoordinator])
   private val forwardingManager: ForwardingManager = mock(classOf[ForwardingManager])
@@ -195,6 +196,9 @@ class KafkaApisTest extends Logging {
       groupCoordinator = groupCoordinator,
       txnCoordinator = txnCoordinator,
       shareCoordinator = shareCoordinator,
+      globalSequenceCoordinator = globalSequenceCoordinator,
+      indexRoutingManager = mock(classOf[IndexRoutingManager]),
+      globalSequenceFetchManager = mock(classOf[GlobalSequenceFetchManager]),
       autoTopicCreationManager = autoTopicCreationManager,
       brokerId = brokerId,
       config = config,
@@ -2833,7 +2837,8 @@ class KafkaApisTest extends Logging {
       responseCallback.capture(),
       any(),
       ArgumentMatchers.eq(requestLocal),
-      any()
+      any(),
+      any[Option[Long]]()
     )).thenAnswer(_ => responseCallback.getValue.apply(Map(new TopicIdPartition(topicId,tp2) -> new PartitionResponse(Errors.NONE))))
     kafkaApis = createKafkaApis()
     kafkaApis.handleWriteTxnMarkersRequest(request, requestLocal)
@@ -2888,7 +2893,9 @@ class KafkaApisTest extends Logging {
       any(),
       any(),
       ArgumentMatchers.eq(requestLocal),
-      any())
+      any(),
+      any[Option[Long]]()
+    )
   }
 
   @Test
@@ -2966,7 +2973,8 @@ class KafkaApisTest extends Logging {
       responseCallback.capture(),
       any(),
       ArgumentMatchers.eq(RequestLocal.noCaching),
-      any()
+      any(),
+      any[Option[Long]]()
     )).thenAnswer { _ =>
       responseCallback.getValue.apply(
         entriesPerPartition.getValue.keySet.map { tp =>

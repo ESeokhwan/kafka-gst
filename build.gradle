@@ -901,6 +901,7 @@ project(':server') {
     implementation project(':server-common')
     implementation project(':storage')
     implementation project(':group-coordinator')
+    implementation project(':global-sequence-coordinator')
     implementation project(':transaction-coordinator')
     implementation project(':raft')
     implementation project(':share-coordinator')
@@ -1010,6 +1011,7 @@ project(':core') {
     implementation project(':server-common')
     implementation project(':group-coordinator:group-coordinator-api')
     implementation project(':group-coordinator')
+    implementation project(':global-sequence-coordinator')
     implementation project(':transaction-coordinator')
     implementation project(':metadata')
     implementation project(':storage:storage-api')
@@ -1035,6 +1037,7 @@ project(':core') {
     implementation libs.slf4jApi
     implementation libs.re2j
 
+    testImplementation project(':examples')
     testImplementation project(':clients').sourceSets.test.output
     testImplementation project(':group-coordinator').sourceSets.test.output
     testImplementation project(':share-coordinator').sourceSets.test.output
@@ -1679,6 +1682,71 @@ project(':coordinator-common') {
   checkstyle {
     configProperties = checkstyleConfigProperties("import-control-coordinator-common.xml")
   }
+
+  javadoc {
+    enabled = false
+  }
+}
+
+project(':global-sequence-coordinator') {
+  base {
+    archivesName = "kafka-global-sequence-coordinator"
+  }
+
+  configurations {
+    generator
+  }
+
+  dependencies {
+    implementation project(':clients')
+    implementation project(':coordinator-common')
+    implementation project(':metadata')
+    implementation project(':server-common')
+    implementation libs.jacksonDatabind
+    implementation libs.metrics
+    implementation libs.slf4jApi
+
+    testImplementation project(':clients').sourceSets.test.output
+    testImplementation project(':coordinator-common').sourceSets.test.output
+    testImplementation project(':server-common').sourceSets.test.output
+    testImplementation libs.junitJupiter
+    testImplementation libs.mockitoCore
+    testImplementation testLog4j2Libs
+    testRuntimeOnly runtimeTestLibs
+
+    generator project(':generator')
+  }
+
+  sourceSets {
+    main {
+      java {
+        srcDirs = ["src/main/java", "${projectDir}/build/generated/main/java"]
+      }
+    }
+  }
+
+  checkstyle {
+    configProperties = checkstyleConfigProperties("import-control-global-sequence-coordinator.xml")
+  }
+
+  task processMessages(type:JavaExec) {
+    mainClass = "org.apache.kafka.message.MessageGenerator"
+    classpath = configurations.generator
+    args = [ "-p", "org.apache.kafka.coordinator.globalsequence.generated",
+             "-o", "${projectDir}/build/generated/main/java/org/apache/kafka/coordinator/globalsequence/generated",
+             "-i", "src/main/resources/common/message",
+             "-m", "MessageDataGenerator", "JsonConverterGenerator",
+             "-t", "CoordinatorRecordTypeGenerator", "CoordinatorRecordJsonConvertersGenerator"
+    ]
+    inputs.dir("src/main/resources/common/message")
+            .withPropertyName("messages")
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.cacheIf { true }
+    outputs.dir("${projectDir}/build/generated/main/java/org/apache/kafka/coordinator/globalsequence/generated")
+  }
+
+  compileJava.dependsOn 'processMessages'
+  srcJar.dependsOn 'processMessages'
 
   javadoc {
     enabled = false

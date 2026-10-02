@@ -352,6 +352,20 @@ public abstract class AbstractRequest implements AbstractRequestResponse {
                 return DescribeShareGroupOffsetsRequest.parse(readable, apiVersion);
             case ALTER_SHARE_GROUP_OFFSETS:
                 return AlterShareGroupOffsetsRequest.parse(readable, apiVersion);
+            case REGISTER_GLOBAL_SEQUENCE_INDEXER:
+                return RegisterGlobalSequenceIndexerRequest.parse(readable, apiVersion);
+            case DESCRIBE_GLOBAL_SEQUENCE_PARTITION:
+                return DescribeGlobalSequencePartitionRequest.parse(readable, apiVersion);
+            case APPEND_GLOBAL_SEQUENCE_INDEX:
+                return AppendGlobalSequenceIndexRequest.parse(readable, apiVersion);
+            case FETCH_GLOBAL_SEQUENCE:
+                return FetchGlobalSequenceRequest.parse(readable, apiVersion);
+            case READ_GLOBAL_SEQUENCE_DATA:
+                return ReadGlobalSequenceDataRequest.parse(readable, apiVersion);
+            case LOOKUP_GLOBAL_SEQUENCE:
+                return LookupGlobalSequenceRequest.parse(readable, apiVersion);
+            case READ_GLOBAL_SEQUENCE_INDEX:
+                return ReadGlobalSequenceIndexRequest.parse(readable, apiVersion);
             case DELETE_SHARE_GROUP_OFFSETS:
                 return DeleteShareGroupOffsetsRequest.parse(readable, apiVersion);
             case BROKER_EXTENSION:

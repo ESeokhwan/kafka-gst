@@ -122,6 +122,14 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         private int appendLingerMs;
         private ExecutorService executorService;
 
+        private java.util.function.BiFunction<TopicPartition, Boolean, Runnable> operationAdmission = (tp, write) -> () -> { };
+
+        /** Admission for read/write events only. Release follows actual execution/commit, not caller cancellation or timeout. */
+        public Builder<S, U> withOperationAdmission(java.util.function.BiFunction<TopicPartition, Boolean, Runnable> admission) {
+            this.operationAdmission = java.util.Objects.requireNonNull(admission);
+            return this;
+        }
+
         public Builder<S, U> withLogPrefix(String logPrefix) {
             this.logPrefix = logPrefix;
             return this;
@@ -242,7 +250,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 serializer,
                 compression,
                 appendLingerMs,
-                executorService
+                executorService,
+                operationAdmission
             );
         }
     }
@@ -698,11 +707,12 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 throw new IllegalStateException("Coordinator must be in loading state");
             }
 
-            loader.load(tp, coordinator).whenComplete((summary, exception) -> {
+            SnapshottableCoordinator<S, U> loadingCoordinator = coordinator;
+            loader.load(tp, loadingCoordinator).whenComplete((summary, exception) -> {
                 scheduleInternalOperation("CompleteLoad(tp=" + tp + ", epoch=" + epoch + ")", tp, () -> {
                     CoordinatorContext context = coordinators.get(tp);
                     if (context != null)  {
-                        if (context.state != CoordinatorState.LOADING) {
+                        if (context.state != CoordinatorState.LOADING || context.coordinator != loadingCoordinator) {
                             log.info("Ignored load completion from {} because context is in {} state.",
                                 context.tp, context.state);
                             return;
@@ -847,9 +857,27 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          */
         private void failCurrentBatch(Throwable t) {
             if (currentBatch != null) {
-                coordinator.revertLastWrittenOffset(currentBatch.baseOffset);
-                currentBatch.deferredEvents.complete(t);
+                boolean reverted = tryRevertLastWrittenOffset(currentBatch.baseOffset);
+                DeferredEventCollection events = currentBatch.deferredEvents;
                 freeCurrentBatch();
+                if (!reverted && state == CoordinatorState.ACTIVE) {
+                    transitionTo(CoordinatorState.FAILED);
+                }
+                events.complete(t);
+            }
+        }
+
+        /**
+         * Attempts to restore both snapshot state and shard bookkeeping. The caller must
+         * fail the shard after releasing its current batch if restoration fails.
+         */
+        private boolean tryRevertLastWrittenOffset(long offset) {
+            try {
+                coordinator.revertLastWrittenOffset(offset);
+                return true;
+            } catch (Throwable t) {
+                log.error("Failed to restore coordinator {} to offset {}.", tp, offset, t);
+                return false;
             }
         }
 
@@ -1137,7 +1165,9 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
 
                 deferredEventQueue.add(offset, DeferredEventCollection.of(log, event));
             } catch (Throwable t) {
-                coordinator.revertLastWrittenOffset(prevLastWrittenOffset);
+                if (!tryRevertLastWrittenOffset(prevLastWrittenOffset)) {
+                    transitionTo(CoordinatorState.FAILED);
+                }
                 event.complete(t);
             }
         }
@@ -1161,7 +1191,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         public void run() {
             String name = event.toString();
             scheduleInternalOperation("OperationTimeout(name=" + name + ", tp=" + tp + ")", tp,
-                () -> event.complete(new TimeoutException(name + " timed out after " + delayMs + "ms")));
+                () -> event.onTimeout(new TimeoutException(name + " timed out after " + delayMs + "ms")));
         }
     }
 
@@ -1239,6 +1269,26 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
     }
 
     /**
+     * A write operation that also receives the runtime's committed boundary and leader
+     * epoch at execution time. As with {@link CoordinatorWriteOperation}, persistent state
+     * changes must be represented by the returned records and applied through replay.
+     *
+     * @param <S> The type of the coordinator state machine.
+     * @param <T> The type of the response.
+     * @param <U> The type of the records.
+     */
+    @FunctionalInterface
+    public interface CoordinatorWriteOperationWithContext<S, T, U> {
+        /**
+         * @param coordinator The coordinator state machine.
+         * @param context     The immutable view captured while executing this operation.
+         * @return A result containing a list of records and the RPC result.
+         * @throws KafkaException if the operation cannot be performed.
+         */
+        CoordinatorResult<T, U> generateRecordsAndResult(S coordinator, CoordinatorWriteContext context) throws KafkaException;
+    }
+
+    /**
      * A coordinator event that modifies the coordinator state.
      *
      * @param <T> The type of the response.
@@ -1283,7 +1333,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         /**
          * The write operation to execute.
          */
-        final CoordinatorWriteOperation<S, T, U> op;
+        final CoordinatorWriteOperationWithContext<S, T, U> op;
 
         /**
          * The future that will be completed with the response
@@ -1300,6 +1350,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          * The operation timeout.
          */
         private OperationTimeout operationTimeout = null;
+        private final Runnable releaseOperation;
+        private boolean operationReleased;
 
         /**
          * The result of the write operation. It could be null
@@ -1330,6 +1382,15 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             TopicPartition tp,
             Duration writeTimeout,
             CoordinatorWriteOperation<S, T, U> op
+        ) {
+            this(name, tp, writeTimeout, (coordinator, context) -> op.generateRecordsAndResult(coordinator));
+        }
+
+        CoordinatorWriteEvent(
+            String name,
+            TopicPartition tp,
+            Duration writeTimeout,
+            CoordinatorWriteOperationWithContext<S, T, U> op
         ) {
             this(
                 name,
@@ -1363,7 +1424,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             short producerEpoch,
             VerificationGuard verificationGuard,
             Duration writeTimeout,
-            CoordinatorWriteOperation<S, T, U> op
+            CoordinatorWriteOperationWithContext<S, T, U> op
         ) {
             this.tp = tp;
             this.name = name;
@@ -1376,6 +1437,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             this.createdTimeMs = time.milliseconds();
             this.writeTimeout = writeTimeout;
             this.deferredEventQueuedTimestamp = NOT_QUEUED;
+            this.releaseOperation = operationAdmission.apply(tp, true);
         }
 
         /**
@@ -1396,7 +1458,10 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 // Get the context of the coordinator or fail if the coordinator is not in active state.
                 withActiveContextOrThrow(tp, context -> {
                     // Execute the operation.
-                    result = op.generateRecordsAndResult(context.coordinator.coordinator());
+                    result = op.generateRecordsAndResult(
+                        context.coordinator.coordinator(),
+                        new CoordinatorWriteContext(context.coordinator.lastCommittedOffset(), context.epoch)
+                    );
 
                     // Append the records and replay them to the state machine.
                     context.append(
@@ -1431,6 +1496,15 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          */
         @Override
         public void complete(Throwable exception) {
+            if (!operationReleased) {
+                operationReleased = true;
+                releaseOperation.run();
+            }
+            onTimeout(exception);
+        }
+
+        @Override
+        public void onTimeout(Throwable exception) {
             if (future.isDone()) {
                 return;
             }
@@ -1488,6 +1562,11 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         T generateResponse(S state, long offset) throws KafkaException;
     }
 
+    /** A read operation with the committed offset and the actual active coordinator epoch. */
+    public interface CoordinatorReadOperationWithContext<S, T> {
+        T generateResponse(S state, CoordinatorReadContext context) throws KafkaException;
+    }
+
     /**
      * A coordinator that reads the committed coordinator state.
      *
@@ -1507,7 +1586,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         /**
          * The read operation to execute.
          */
-        final CoordinatorReadOperation<S, T> op;
+        final CoordinatorReadOperationWithContext<S, T> op;
 
         /**
          * The future that will be completed with the response
@@ -1520,6 +1599,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          * if an exception is thrown before it is assigned.
          */
         T response;
+        private final Runnable releaseOperation;
+        private boolean operationReleased;
 
         /**
          * The time this event was created.
@@ -1536,13 +1617,14 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         CoordinatorReadEvent(
             String name,
             TopicPartition tp,
-            CoordinatorReadOperation<S, T> op
+            CoordinatorReadOperationWithContext<S, T> op
         ) {
             this.tp = tp;
             this.name = name;
             this.op = op;
             this.future = new CompletableFuture<>();
             this.createdTimeMs = time.milliseconds();
+            this.releaseOperation = operationAdmission.apply(tp, false);
         }
 
         /**
@@ -1565,7 +1647,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     // Execute the read operation.
                     response = op.generateResponse(
                         context.coordinator.coordinator(),
-                        context.coordinator.lastCommittedOffset()
+                        new CoordinatorReadContext(context.coordinator.lastCommittedOffset(), context.epoch)
                     );
 
                     // The response can be completed immediately.
@@ -1584,6 +1666,10 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          */
         @Override
         public void complete(Throwable exception) {
+            if (!operationReleased) {
+                operationReleased = true;
+                releaseOperation.run();
+            }
             if (exception == null) {
                 future.complete(response);
             } else {
@@ -1892,15 +1978,21 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     if (context != null) {
                         context.lock.lock();
                         try {
-                            if (context.state == CoordinatorState.ACTIVE) {
+                            if (context.state == CoordinatorState.ACTIVE && context.highWatermarklistener == this) {
                                 // The updated high watermark can be applied to the coordinator only if the coordinator
                                 // exists and is in the active state.
                                 log.debug("Updating high watermark of {} to {}.", tp, newHighWatermark);
-                                context.coordinator.updateLastCommittedOffset(newHighWatermark);
+                                try {
+                                    context.coordinator.updateLastCommittedOffset(newHighWatermark);
+                                } catch (Throwable t) {
+                                    // Committed bookkeeping must be restored by loading before more writes run.
+                                    context.transitionTo(CoordinatorState.FAILED);
+                                    throw t;
+                                }
                                 context.deferredEventQueue.completeUpTo(newHighWatermark);
                                 coordinatorMetrics.onUpdateLastCommittedOffset(tp, newHighWatermark);
                             } else {
-                                log.debug("Ignored high watermark updated for {} to {} because the coordinator is not active.",
+                                log.debug("Ignored high watermark updated for {} to {} because the coordinator is not active or the listener is stale.",
                                     tp, newHighWatermark);
                             }
                         } finally {
@@ -2018,6 +2110,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
      */
     private volatile MetadataImage metadataImage = MetadataImage.EMPTY;
 
+    private final java.util.function.BiFunction<TopicPartition, Boolean, Runnable> operationAdmission;
+
     /**
      * Constructor.
      *
@@ -2036,6 +2130,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
      * @param compression                       The compression codec.
      * @param appendLingerMs                    The append linger time in ms.
      * @param executorService                   The executor service.
+     * @param operationAdmission                Admission and completion hook for client read/write events.
      */
     @SuppressWarnings("checkstyle:ParameterNumber")
     private CoordinatorRuntime(
@@ -2053,8 +2148,10 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         Serializer<U> serializer,
         Compression compression,
         int appendLingerMs,
-        ExecutorService executorService
+        ExecutorService executorService,
+        java.util.function.BiFunction<TopicPartition, Boolean, Runnable> operationAdmission
     ) {
+        this.operationAdmission = operationAdmission;
         this.logPrefix = logPrefix;
         this.logContext = logContext;
         this.log = logContext.logger(CoordinatorRuntime.class);
@@ -2094,6 +2191,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         try {
             processor.enqueueLast(event);
         } catch (RejectedExecutionException ex) {
+            event.complete(ex);
             throw new NotCoordinatorException("Can't accept an event because the processor is closed", ex);
         }
     }
@@ -2108,6 +2206,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         try {
             processor.enqueueFirst(event);
         } catch (RejectedExecutionException ex) {
+            event.complete(ex);
             throw new NotCoordinatorException("Can't accept an event because the processor is closed", ex);
         }
     }
@@ -2184,6 +2283,27 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         TopicPartition tp,
         Duration timeout,
         CoordinatorWriteOperation<S, T, U> op
+    ) {
+        return scheduleWriteOperationWithContext(name, tp, timeout, (coordinator, context) -> op.generateRecordsAndResult(coordinator));
+    }
+
+    /**
+     * Schedules a write with a context captured under the active coordinator lock when
+     * the event executes, rather than when it is enqueued. Empty record results retain
+     * the normal pending-write barrier; a timeout does not roll back appended records.
+     *
+     * @param name      The name of the write operation.
+     * @param tp        The coordinator's topic partition.
+     * @param timeout   The write operation timeout.
+     * @param op        The write operation receiving the execution context.
+     * @param <T>       The type of the result.
+     * @return A future completed after the write is committed, or exceptionally on failure.
+     */
+    public <T> CompletableFuture<T> scheduleWriteOperationWithContext(
+        String name,
+        TopicPartition tp,
+        Duration timeout,
+        CoordinatorWriteOperationWithContext<S, T, U> op
     ) {
         throwIfNotRunning();
         log.debug("Scheduled execution of write operation {}.", name);
@@ -2262,7 +2382,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 producerEpoch,
                 verificationGuard,
                 timeout,
-                op
+                (coordinator, context) -> op.generateRecordsAndResult(coordinator)
             );
             enqueueLast(event);
             return event.future;
@@ -2323,6 +2443,16 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         String name,
         TopicPartition tp,
         CoordinatorReadOperation<S, T> op
+    ) {
+        return scheduleReadOperationWithContext(name, tp, (shard, context) ->
+            op.generateResponse(shard, context.highWatermark()));
+    }
+
+    /** Schedules a committed read; captures HW and epoch under the active coordinator lock. */
+    public <T> CompletableFuture<T> scheduleReadOperationWithContext(
+        String name,
+        TopicPartition tp,
+        CoordinatorReadOperationWithContext<S, T> op
     ) {
         throwIfNotRunning();
         log.debug("Scheduled execution of read operation {}.", name);

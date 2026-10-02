@@ -23,6 +23,8 @@ import kafka.network.RequestChannel;
 import kafka.server.AutoTopicCreationManager;
 import kafka.server.FetchManager;
 import kafka.server.ForwardingManager;
+import kafka.server.GlobalSequenceFetchManager;
+import kafka.server.IndexRoutingManager;
 import kafka.server.KafkaApis;
 import kafka.server.KafkaConfig;
 import kafka.server.QuotaFactory.QuotaManagers;
@@ -32,6 +34,7 @@ import kafka.server.share.SharePartitionManager;
 import org.apache.kafka.common.internals.Plugin;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinator;
 import org.apache.kafka.coordinator.group.GroupConfigManager;
 import org.apache.kafka.coordinator.group.GroupCoordinator;
 import org.apache.kafka.coordinator.share.ShareCoordinator;
@@ -72,6 +75,9 @@ public class KafkaApisBuilder {
     private ApiVersionManager apiVersionManager = null;
     private ClientMetricsManager clientMetricsManager = null;
     private ShareCoordinator shareCoordinator = null;
+    private GlobalSequenceCoordinator globalSequenceCoordinator = null;
+    private IndexRoutingManager indexRoutingManager = null;
+    private GlobalSequenceFetchManager globalSequenceFetchManager = null;
     private GroupConfigManager groupConfigManager = null;
     private BrokerExtensionRegistry brokerExtensionRegistry = null;
     private Scheduler brokerExtensionScheduler = null;
@@ -98,6 +104,21 @@ public class KafkaApisBuilder {
 
     public KafkaApisBuilder setTxnCoordinator(TransactionCoordinator txnCoordinator) {
         this.txnCoordinator = txnCoordinator;
+        return this;
+    }
+
+    public KafkaApisBuilder setGlobalSequenceFetchManager(GlobalSequenceFetchManager manager) {
+        this.globalSequenceFetchManager = manager;
+        return this;
+    }
+
+    public KafkaApisBuilder setIndexRoutingManager(IndexRoutingManager router) {
+        this.indexRoutingManager = router;
+        return this;
+    }
+
+    public KafkaApisBuilder setGlobalSequenceCoordinator(GlobalSequenceCoordinator coordinator) {
+        this.globalSequenceCoordinator = coordinator;
         return this;
     }
 
@@ -209,6 +230,9 @@ public class KafkaApisBuilder {
         if (groupCoordinator == null) throw new RuntimeException("You must set groupCoordinator");
         if (txnCoordinator == null) throw new RuntimeException("You must set txnCoordinator");
         if (shareCoordinator == null) throw new RuntimeException("You must set shareCoordinator");
+        if (globalSequenceCoordinator == null) throw new RuntimeException("You must set globalSequenceCoordinator");
+        if (globalSequenceFetchManager == null) throw new RuntimeException("You must set globalSequenceFetchManager");
+        if (indexRoutingManager == null) throw new RuntimeException("You must set indexRoutingManager");
         if (autoTopicCreationManager == null) throw new RuntimeException("You must set autoTopicCreationManager");
         if (config == null) config = new KafkaConfig(Map.of());
         if (configRepository == null) throw new RuntimeException("You must set configRepository");
@@ -228,6 +252,9 @@ public class KafkaApisBuilder {
                              groupCoordinator,
                              txnCoordinator,
                              shareCoordinator,
+                             globalSequenceCoordinator,
+                             indexRoutingManager,
+                             globalSequenceFetchManager,
                              autoTopicCreationManager,
                              brokerId,
                              config,
