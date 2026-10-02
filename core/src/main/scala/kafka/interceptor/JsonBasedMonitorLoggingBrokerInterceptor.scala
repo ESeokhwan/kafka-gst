@@ -53,9 +53,13 @@ class JsonBasedMonitorLoggingBrokerInterceptor(
           batch.forEach(record => {
             val value = record.value()
             if (value != null) {
-              monitorLogWriter.submit(
-                new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "NETWORK_PROCESSED", currentTime)
-              )
+              val message = Utils.utf8(value)
+              val coreMessage = messageAdapter.extractMessageId(message)
+              if (coreMessage.startsWith("R")) {
+                monitorLogWriter.submit(
+                  new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "NETWORK_PROCESSED", currentTime)
+                )
+              }
             }
           })
         })
@@ -76,9 +80,13 @@ class JsonBasedMonitorLoggingBrokerInterceptor(
           batch.forEach(record => {
             val value = record.value()
             if (value != null) {
-              monitorLogWriter.submit(
-                new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "IO_COMMITED", currentTime)
-              )
+              val message = Utils.utf8(value)
+              val coreMessage = messageAdapter.extractMessageId(message)
+              if (coreMessage.startsWith("R")) {
+                monitorLogWriter.submit(
+                  new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "IO_COMMITED", currentTime)
+                )
+              }
             }
           })
         })
